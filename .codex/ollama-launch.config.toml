@@ -1,4 +1,4 @@
-model = "gpt-oss:120b"
+model = "gpt-oss:120b-cloud"
 model_provider = "ollama-launch"
 model_catalog_json = "/Users/you/.codex/model.json"
 
