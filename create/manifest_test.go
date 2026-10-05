@@ -225,6 +225,32 @@ func TestNewSafetensorsManifestWriterPreservesExplicitVersion(t *testing.T) {
 	}
 }
 
+func TestNewSafetensorsManifestWriterNVFP4MinimumVersion(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	writeManifest := NewSafetensorsManifestWriter(SafetensorsManifestOptions{MinVersion: "0.19.0"})
+	for _, tc := range []struct {
+		name     string
+		class    Classification
+		requires string
+		want     string
+	}{
+		{"float-nvfp4", Classification{Kind: SourceFloat, Quantize: "nvfp4"}, "", nvfp4GlobalScaleMinOllamaVersion},
+		{"float-nvfp4-explicit-old", Classification{Kind: SourceFloat, Quantize: "nvfp4"}, "0.19.0", nvfp4GlobalScaleMinOllamaVersion},
+		{"float-nvfp4-explicit-new", Classification{Kind: SourceFloat, Quantize: "nvfp4"}, "0.40.0", "0.40.0"},
+		{"float-int4", Classification{Kind: SourceFloat, Quantize: "int4"}, "", "0.19.0"},
+		{"prequantized-nvfp4", Classification{Kind: SourcePrequantized, Quantize: "nvfp4"}, "", "0.19.0"},
+	} {
+		info := ManifestInfo{Class: tc.class, ModelConfig: model.ConfigV2{Requires: tc.requires}}
+		if err := writeManifest(context.Background(), "test-"+tc.name, info); err != nil {
+			t.Fatal(err)
+		}
+		if got := readSafetensorsManifestConfig(t, "test-"+tc.name).Requires; got != tc.want {
+			t.Errorf("%s: requires = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestNewSafetensorsManifestWriterDoesNotPublishAfterCancellation(t *testing.T) {
 	t.Setenv("OLLAMA_MODELS", t.TempDir())
 

@@ -156,6 +156,9 @@ type SwitchMLP struct {
 	GateUpGlobalScale                         *mlx.Array
 	GateGlobalScale, UpGlobalScale            *mlx.Array
 	DownGlobalScale                           *mlx.Array
+	// GateUpGateScale and GateUpUpScale scale the fused bank's gate and up
+	// halves after the split, when their uniform global scales differ.
+	GateUpGateScale, GateUpUpScale *mlx.Array
 
 	GateUpBits, GateBits, UpBits, DownBits                     int
 	GateUpGroupSize, GateGroupSize, UpGroupSize, DownGroupSize int
@@ -647,8 +650,9 @@ func canFuseQuantizedGateUp(gateW, upW *stackedExpertWeights) bool {
 		return false
 	}
 	// One scale per expert covers the whole bank row, so gate and up can share
-	// a fused bank when their scales agree.
-	if !model.SameGlobalScales(gateW.GlobalScales, upW.GlobalScales) {
+	// a fused bank when their scales agree, or when each is uniform across
+	// experts and can scale its half after the split instead.
+	if _, _, _, ok := model.FusedGlobalScales(gateW.GlobalScales, upW.GlobalScales); !ok {
 		return false
 	}
 	if gateW.Bits != upW.Bits || gateW.GroupSize != upW.GroupSize || gateW.Mode != upW.Mode {
@@ -722,13 +726,6 @@ func linearGlobalScale(l nn.LinearLayer) *mlx.Array {
 		return q.GlobalScale
 	}
 	return nil
-}
-
-func applyDenseGlobalScale(x, globalScale *mlx.Array) *mlx.Array {
-	if globalScale == nil {
-		return x
-	}
-	return mlx.Mul(x, mlx.DivScalar(globalScale, mlx.Nvfp4MaxProduct)).AsType(x.DType())
 }
 
 func splitLastDim(x *mlx.Array, first int32) (*mlx.Array, *mlx.Array) {
@@ -1062,7 +1059,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 					sw.GateUpWeightQ = fuseExpertStacks(gateW.Weight, upW.Weight, 1)
 					sw.GateUpScales = fuseExpertStacks(gateW.Scales, upW.Scales, 1)
 					sw.GateUpBiases = fuseExpertStacks(gateW.Biases, upW.Biases, 1)
-					sw.GateUpGlobalScale = gateW.GlobalScales
+					sw.GateUpGlobalScale, sw.GateUpGateScale, sw.GateUpUpScale, _ = model.FusedGlobalScales(gateW.GlobalScales, upW.GlobalScales)
 					sw.GateUpBits, sw.GateUpGroupSize, sw.GateUpMode = gateW.Bits, gateW.GroupSize, gateW.Mode
 				} else {
 					sw.GateWeightQ, sw.GateScales, sw.GateBiases = gateW.Weight, gateW.Scales, gateW.Biases
@@ -1176,11 +1173,9 @@ func (m *DenseMLP) Forward(x *mlx.Array, _ *Config) *mlx.Array {
 	if m.GateUpProj != nil {
 		gateUp := m.GateUpProj.Forward(x)
 		gate, up := splitLastDim(gateUp, int32(gateUp.Dim(len(gateUp.Dims())-1))/2)
-		gate = applyDenseGlobalScale(gate, m.GateUpGateScale)
-		up = applyDenseGlobalScale(up, m.GateUpUpScale)
-		return m.DownProj.Forward(mlx.SwiGLU(gate, up))
+		return m.DownProj.Forward(mlx.SwiGLUScaled(gate, m.GateUpGateScale, up, m.GateUpUpScale))
 	}
-	return m.DownProj.Forward(mlx.SwiGLU(m.GateProj.Forward(x), m.UpProj.Forward(x)))
+	return m.DownProj.Forward(nn.SwiGLU(m.GateProj, m.UpProj, x))
 }
 
 func weightForGatherMM(w *mlx.Array, sourceLayout bool) *mlx.Array {
@@ -1218,7 +1213,7 @@ func (s *SwitchMLP) Forward(x *mlx.Array, indices *mlx.Array, cfg *Config) *mlx.
 		mid := int32(guDims[len(guDims)-1] / 2)
 		gate = mlx.SliceStartStop(gateUp, []int32{0, 0, 0, 0}, []int32{int32(guDims[0]), int32(guDims[1]), int32(guDims[2]), mid})
 		up = mlx.SliceStartStop(gateUp, []int32{0, 0, 0, mid}, []int32{int32(guDims[0]), int32(guDims[1]), int32(guDims[2]), int32(guDims[len(guDims)-1])})
-		hidden = mlx.SwiGLU(gate, up)
+		hidden = mlx.SwiGLUScaled(gate, s.GateUpGateScale, up, s.GateUpUpScale)
 	case s.GateWeightQ != nil && s.UpWeightQ != nil:
 		gate = mlx.GatherQMM(xFlat, s.GateWeightQ, s.GateScales, s.GateBiases, nil, idxFlat, true, s.GateGroupSize, s.GateBits, s.GateMode,
 			s.GateGlobalScale, doSort)

@@ -189,6 +189,9 @@ type SwitchMLP struct {
 	GateWeightQ, GateScales, GateBiases     *mlx.Array
 	UpWeightQ, UpScales, UpBiases           *mlx.Array
 	GateGlobalScales, UpGlobalScales        *mlx.Array
+	// GateUpGateScale and GateUpUpScale scale the fused bank's gate and up
+	// halves after the split, when their uniform global scales differ.
+	GateUpGateScale, GateUpUpScale *mlx.Array
 
 	GateUpBits      int
 	DownBits        int
@@ -212,6 +215,9 @@ type stackedExpertWeights struct {
 	Bits         int
 	GroupSize    int
 	Mode         string
+	// GateScale and UpScale scale a fused gate/up bank's halves after the
+	// split, when their uniform global scales differ.
+	GateScale, UpScale *mlx.Array
 }
 
 func parseConfig(configData []byte) (Config, error) {
@@ -509,7 +515,9 @@ func fuseExpertStacks(a, b *mlx.Array, axis int) *mlx.Array {
 
 // fuseGateUpProjections joins gate and up stacks along the output dimension,
 // which is exact for quantized stacks: groups run along the input dimension,
-// and a global scale covers the whole bank row.
+// and a global scale covers the whole bank row. Global scales that differ
+// between gate and up but are each uniform across experts scale their halves
+// after the split instead.
 func fuseGateUpProjections(gate, up *stackedExpertWeights) *stackedExpertWeights {
 	if gate == nil || up == nil {
 		return nil
@@ -518,13 +526,18 @@ func fuseGateUpProjections(gate, up *stackedExpertWeights) *stackedExpertWeights
 		return nil
 	}
 	if gate.Scales != nil && up.Scales != nil &&
-		model.SameGlobalScales(gate.GlobalScales, up.GlobalScales) &&
 		gate.Bits == up.Bits && gate.GroupSize == up.GroupSize && gate.Mode == up.Mode &&
 		(gate.Biases == nil) == (up.Biases == nil) {
+		bankScale, gateScale, upScale, ok := model.FusedGlobalScales(gate.GlobalScales, up.GlobalScales)
+		if !ok {
+			return nil
+		}
 		fused := &stackedExpertWeights{
 			Weight:       fuseExpertStacks(gate.Weight, up.Weight, 1),
 			Scales:       fuseExpertStacks(gate.Scales, up.Scales, 1),
-			GlobalScales: gate.GlobalScales,
+			GlobalScales: bankScale,
+			GateScale:    gateScale,
+			UpScale:      upScale,
 			Bits:         gate.Bits,
 			GroupSize:    gate.GroupSize,
 			Mode:         gate.Mode,
@@ -816,6 +829,8 @@ func loadSwitchMLP(tensors map[string]*mlx.Array, cfg *Config, useQuantized bool
 			switchMLP.GateUpScales = gateUpW.Scales
 			switchMLP.GateUpBias = gateUpW.Biases
 			switchMLP.GateUpGlobalScales = gateUpW.GlobalScales
+			switchMLP.GateUpGateScale = gateUpW.GateScale
+			switchMLP.GateUpUpScale = gateUpW.UpScale
 			switchMLP.GateUpBits = gateUpW.Bits
 			switchMLP.GateUpGroupSize = gateUpW.GroupSize
 			switchMLP.GateUpMode = gateUpW.Mode
@@ -1246,7 +1261,7 @@ func (s *SwitchMLP) Forward(x *mlx.Array, indices *mlx.Array, cfg *Config) *mlx.
 			up = mlx.GatherMM(xFlat, s.UpWeight, nil, idxFlat, doSort)
 		}
 	}
-	hidden := mlx.SwiGLU(gate, up)
+	hidden := mlx.SwiGLUScaled(gate, s.GateUpGateScale, up, s.GateUpUpScale)
 	if s.DownWeightQ != nil {
 		down = mlx.GatherQMM(hidden, s.DownWeightQ, s.DownScales, s.DownBiases,
 			nil, idxFlat, true, s.DownGroupSize, s.DownBits, s.DownMode,

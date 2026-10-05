@@ -680,5 +680,5 @@ func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positio
 }
 
 func (m *MLP) Forward(x *mlx.Array) *mlx.Array {
-	return m.DownProj.Forward(mlx.SwiGLU(m.GateProj.Forward(x), m.UpProj.Forward(x)))
+	return m.DownProj.Forward(nn.SwiGLU(m.GateProj, m.UpProj, x))
 }

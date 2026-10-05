@@ -212,10 +212,12 @@ func (p *Qwen3Parser) eat() ([]qwen3Event, bool) {
 				after = strings.TrimLeftFunc(after, unicode.IsSpace)
 				p.buffer.Reset()
 				p.buffer.WriteString(after)
+				p.maybeThinkingOpenAtBOL = false
 				if after == "" {
+					// Whitespace after the tag can arrive in later chunks.
+					p.state = qwen3ParserStateThinkingStartedEatingWhitespace
 					return events, false
 				}
-				p.maybeThinkingOpenAtBOL = false
 				return events, true
 			}
 			if strings.HasPrefix(qwen3ThinkingOpenTag, trimmed) {

@@ -87,3 +87,38 @@ func SameGlobalScales(a, b *mlx.Array) bool {
 	}
 	return true
 }
+
+// UniformGlobalScale returns the scale every expert of a prepared bank holds,
+// as a one-element array in the same representation, or nil when the bank is
+// nil or its experts differ. Create quantizes a stacked bank against one amax,
+// so its banks are uniform.
+func UniformGlobalScale(bank *mlx.Array) *mlx.Array {
+	if bank == nil || bank.Size() == 0 {
+		return nil
+	}
+	values := bank.Floats()
+	for _, v := range values[1:] {
+		if v != values[0] {
+			return nil
+		}
+	}
+	return mlx.FromValues(values[:1], 1)
+}
+
+// FusedGlobalScales places two prepared banks' global scales once the banks
+// are joined along their output rows. Scales that agree for every expert stay
+// with the joined bank, for gather_qmm to apply. Scales that differ can still
+// share a bank when each is uniform across experts: the bank goes unscaled,
+// and aSplit and bSplit scale the two halves of its output after the split,
+// as mlx.SwiGLUScaled applies them. Per-expert scales that differ cannot
+// share a bank, and ok is false.
+func FusedGlobalScales(a, b *mlx.Array) (bank, aSplit, bSplit *mlx.Array, ok bool) {
+	if SameGlobalScales(a, b) {
+		return a, nil, nil, true
+	}
+	aSplit, bSplit = UniformGlobalScale(a), UniformGlobalScale(b)
+	if aSplit == nil || bSplit == nil {
+		return nil, nil, nil, false
+	}
+	return nil, aSplit, bSplit, true
+}

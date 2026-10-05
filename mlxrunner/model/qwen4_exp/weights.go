@@ -67,6 +67,10 @@ type sparseMoE struct {
 	SharedGateProj nn.LinearLayer
 	SharedUpProj   nn.LinearLayer
 	SharedDownProj nn.LinearLayer
+
+	// One NVFP4 global scale per expert, or nil when the bank has none.
+	GateUpGlobalScales *mlx.Array
+	DownGlobalScales   *mlx.Array
 }
 
 func supportsGatherQMM(mode string, bits int) bool {
@@ -82,7 +86,7 @@ func supportsGatherQMM(mode string, bits int) bool {
 	}
 }
 
-func loadPackedExperts(tensors map[string]*mlx.Array, base string, m *Model) (weight, scales, biases *mlx.Array, group, bits int, mode string, err error) {
+func loadPackedExperts(tensors map[string]*mlx.Array, base string, m *Model) (weight, scales, biases, globalScales *mlx.Array, group, bits int, mode string, err error) {
 	var key string
 	for _, candidate := range []string{base, base + ".weight"} {
 		if weight = tensors[candidate]; weight != nil {
@@ -91,18 +95,20 @@ func loadPackedExperts(tensors map[string]*mlx.Array, base string, m *Model) (we
 		}
 	}
 	if weight == nil {
-		return nil, nil, nil, 0, 0, "", fmt.Errorf("missing packed expert tensor %q", base)
+		return nil, nil, nil, nil, 0, 0, "", fmt.Errorf("missing packed expert tensor %q", base)
 	}
 	scales = tensors[key+"_scale"]
 	if scales == nil {
-		return mlx.Transpose(weight, 0, 2, 1), nil, nil, 0, 0, "", nil
+		return mlx.Transpose(weight, 0, 2, 1), nil, nil, nil, 0, 0, "", nil
 	}
 	biases = tensors[key+"_qbias"]
+	globalScales, _ = model.ReadGlobalScale(tensors, key, base+".weight", base)
+	globalScales = model.PrepareGatherQMMGlobalScale(globalScales, weight.Dim(0))
 	group, bits, mode = model.ResolveLinearQuantParams(m.quantGroup, m.quantBits, m.quantMode, m.tensorQuant, key, weight, scales)
 	if !supportsGatherQMM(mode, bits) {
-		return nil, nil, nil, 0, 0, "", fmt.Errorf("packed expert tensor %q uses unsupported quantization mode=%q bits=%d", key, mode, bits)
+		return nil, nil, nil, nil, 0, 0, "", fmt.Errorf("packed expert tensor %q uses unsupported quantization mode=%q bits=%d", key, mode, bits)
 	}
-	return weight, scales, biases, group, bits, mode, nil
+	return weight, scales, biases, globalScales, group, bits, mode, nil
 }
 
 // PLE is the model's n-gram embedding block. The checkpoint stores one logical
@@ -282,10 +288,10 @@ func (m *Model) loadSparseMoE(linears model.LinearFactory, tensors map[string]*m
 	if moe.Gate, err = requiredLinear(linears, prefix+".gate"); err != nil {
 		return nil, err
 	}
-	if moe.GateUpExperts, moe.GateUpScales, moe.GateUpBiases, moe.GateUpGroup, moe.GateUpBits, moe.GateUpMode, err = loadPackedExperts(tensors, prefix+".experts.gate_up_proj", m); err != nil {
+	if moe.GateUpExperts, moe.GateUpScales, moe.GateUpBiases, moe.GateUpGlobalScales, moe.GateUpGroup, moe.GateUpBits, moe.GateUpMode, err = loadPackedExperts(tensors, prefix+".experts.gate_up_proj", m); err != nil {
 		return nil, err
 	}
-	if moe.DownExperts, moe.DownScales, moe.DownBiases, moe.DownGroup, moe.DownBits, moe.DownMode, err = loadPackedExperts(tensors, prefix+".experts.down_proj", m); err != nil {
+	if moe.DownExperts, moe.DownScales, moe.DownBiases, moe.DownGlobalScales, moe.DownGroup, moe.DownBits, moe.DownMode, err = loadPackedExperts(tensors, prefix+".experts.down_proj", m); err != nil {
 		return nil, err
 	}
 	for name, dst := range map[string]*nn.LinearLayer{

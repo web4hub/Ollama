@@ -70,6 +70,9 @@ func NewSafetensorsManifestWriter(opts SafetensorsManifestOptions) ManifestWrite
 		if config.Requires == "" {
 			config.Requires = opts.MinVersion
 		}
+		if info.Class.Kind == SourceFloat && info.Class.Quantize == "nvfp4" {
+			config.Requires = atLeastVersion(config.Requires, nvfp4GlobalScaleMinOllamaVersion)
+		}
 		fileType := info.Class.Quantize
 		if fileType != "" || config.FileType == "" {
 			config.FileType = fileType
@@ -104,6 +107,19 @@ func NewSafetensorsManifestWriter(opts SafetensorsManifestOptions) ManifestWrite
 		}
 		return manifest.WriteManifest(name, configLayer, manifestLayers)
 	}
+}
+
+// nvfp4GlobalScaleMinOllamaVersion is the first version that applies the
+// NVFP4 global scales written when quantizing float sources, including in
+// MoE expert banks. Older versions load those blobs and decode garbage.
+const nvfp4GlobalScaleMinOllamaVersion = "0.34.1"
+
+// atLeastVersion returns the later of two semantic versions.
+func atLeastVersion(have, need string) string {
+	if have == "" || semver.Compare("v"+strings.TrimPrefix(have, "v"), "v"+need) < 0 {
+		return need
+	}
+	return have
 }
 
 func validateRequires(value string) (string, error) {

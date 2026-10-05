@@ -73,6 +73,33 @@ func TestQwen3ParserThinkingEnabledWithSplitOpeningTag(t *testing.T) {
 	}
 }
 
+// Some checkpoints emit the opening tag as its own token, with the newline
+// after it in a later chunk. That whitespace is trimmed however it arrives.
+func TestQwen3ParserThinkingEnabledWithExplicitOpeningTagStreaming(t *testing.T) {
+	for _, chunks := range [][]string{
+		{"<think>\nLet me think...</think>Answer."},
+		{"<think>", "\n", "Let me think", "...", "</think>", "Answer."},
+		{"<think>", "\n", "\n", "Let me think...", "</think>", "Answer."},
+		{"\n<think>", " ", "Let me think...</think>", "Answer."},
+	} {
+		parser := &Qwen3Parser{hasThinkingSupport: true, defaultThinking: true}
+		parser.Init(nil, nil, &api.ThinkValue{Value: true})
+
+		var content, thinking string
+		for i, chunk := range chunks {
+			c, th, _, err := parser.Add(chunk, i == len(chunks)-1)
+			if err != nil {
+				t.Fatalf("chunks %q: parse failed: %v", chunks, err)
+			}
+			content += c
+			thinking += th
+		}
+		if thinking != "Let me think..." || content != "Answer." {
+			t.Fatalf("chunks %q: thinking %q content %q", chunks, thinking, content)
+		}
+	}
+}
+
 func TestQwen3ParserThinkingDisabled(t *testing.T) {
 	parser := &Qwen3Parser{hasThinkingSupport: false, defaultThinking: false}
 	parser.Init(nil, nil, &api.ThinkValue{Value: false})

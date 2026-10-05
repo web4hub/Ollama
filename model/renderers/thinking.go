@@ -25,8 +25,10 @@ func ThinkingForRenderer(name string) *model.Thinking {
 	return thinking.Clone()
 }
 
-// ResolveThinking preserves explicit booleans and supported names. Omission or
-// an unsupported name uses the default. Unknown metadata preserves legacy handling.
+// ResolveThinking preserves explicit booleans and supported names. An
+// unsupported "none" turns thinking off when the model supports that, matching
+// OpenAI's reasoning_effort. Omission or another unsupported name uses the
+// default. Unknown metadata preserves legacy handling.
 func ResolveThinking(requestedThink *api.ThinkValue, thinking *model.Thinking) *api.ThinkValue {
 	if !thinking.Valid() {
 		return requestedThink
@@ -38,6 +40,9 @@ func ResolveThinking(requestedThink *api.ThinkValue, thinking *model.Thinking) *
 		case string:
 			if thinking.Supports(value) {
 				return requestedThink
+			}
+			if value == "none" && thinking.Supports(false) {
+				return &api.ThinkValue{Value: false}
 			}
 		}
 	}

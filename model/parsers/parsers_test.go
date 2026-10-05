@@ -65,6 +65,7 @@ func TestRegisterCustomParser(t *testing.T) {
 func TestThinkingClose(t *testing.T) {
 	think := func(v bool) *api.ThinkValue { return &api.ThinkValue{Value: v} }
 	contentPrefill := &api.Message{Role: "assistant", Content: "The answer"}
+	emptyAssistant := &api.Message{Role: "assistant"}
 	toolResponse := &api.Message{Role: "tool", Content: "42"}
 	tool := api.Tool{Type: "function", Function: api.ToolFunction{Name: "get_weather"}}
 	thinkTag := []string{"</think>"}
@@ -80,6 +81,10 @@ func TestThinkingClose(t *testing.T) {
 		{parser: "qwen3", think: think(true)},
 		{parser: "qwen3-thinking", want: thinkTag},
 		{parser: "qwen3-thinking", think: think(false)},
+		{parser: "kolibri1", want: thinkTag},
+		{parser: "kolibri1", think: think(false)},
+		{parser: "kolibri1", lastMessage: contentPrefill},
+		{parser: "kolibri1", lastMessage: emptyAssistant, want: thinkTag},
 		{parser: "qwen3.5", want: thinkTag},
 		{parser: "qwen3.5", think: think(false)},
 		{parser: "qwen3.5", lastMessage: contentPrefill},

@@ -343,3 +343,63 @@ func TestMarshalWithSpaces(t *testing.T) {
 		})
 	}
 }
+
+func TestMarshalWithSpacesNoHTMLEscape(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    any
+		expected string
+	}{
+		{
+			name:     "html characters",
+			input:    map[string]any{"text": "<b>a & b</b>"},
+			expected: `{"text": "<b>a & b</b>"}`,
+		},
+		{
+			name:     "nested tool call arguments",
+			input:    map[string]any{"arguments": args(`{"command": "cd src && make 2>&1"}`)},
+			expected: `{"arguments": {"command": "cd src && make 2>&1"}}`,
+		},
+		{
+			name:     "nested tool properties",
+			input:    propsMap(`{"<b>": {"type": "string", "description": "a & b"}}`),
+			expected: `{"<b>": {"type": "string", "description": "a & b"}}`,
+		},
+		{
+			name:     "line and paragraph separators",
+			input:    map[string]any{"text": "a\u2028b\u2029c"},
+			expected: "{\"text\": \"a\u2028b\u2029c\"}",
+		},
+		{
+			name:     "escaped backslash before escape-like text",
+			input:    map[string]any{"text": `\u003c \\u0026`},
+			expected: `{"text": "\\u003c \\\\u0026"}`,
+		},
+		{
+			name:     "other escapes kept",
+			input:    map[string]any{"text": "\"\\\n\x01é"},
+			expected: `{"text": "\"\\\n\u0001é"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := marshalWithSpacesNoHTMLEscape(tt.input)
+			if err != nil {
+				t.Fatalf("marshalWithSpacesNoHTMLEscape failed: %v", err)
+			}
+			if diff := cmp.Diff(string(result), tt.expected); diff != "" {
+				t.Errorf("mismatch (-got +want):\n%s", diff)
+			}
+		})
+	}
+
+	// Other renderers keep encoding/json's escaping.
+	result, err := marshalWithSpaces(map[string]any{"text": "<&>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(result), `{"text": "\u003c\u0026\u003e"}`; got != want {
+		t.Errorf("marshalWithSpaces = %s, want %s", got, want)
+	}
+}

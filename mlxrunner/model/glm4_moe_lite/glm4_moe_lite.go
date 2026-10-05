@@ -161,7 +161,7 @@ type DenseMLP struct {
 
 // Forward applies the SwiGLU MLP
 func (m *DenseMLP) Forward(x *mlx.Array) *mlx.Array {
-	return m.DownProj.Forward(mlx.SwiGLU(m.GateProj.Forward(x), m.UpProj.Forward(x)))
+	return m.DownProj.Forward(nn.SwiGLU(m.GateProj, m.UpProj, x))
 }
 
 // MoEGate implements the expert gating mechanism
@@ -291,7 +291,7 @@ type SharedExperts struct {
 
 // Forward applies the shared expert MLP
 func (s *SharedExperts) Forward(x *mlx.Array) *mlx.Array {
-	return s.DownProj.Forward(mlx.SwiGLU(s.GateProj.Forward(x), s.UpProj.Forward(x)))
+	return s.DownProj.Forward(nn.SwiGLU(s.GateProj, s.UpProj, x))
 }
 
 // MoE implements the full Mixture of Experts layer

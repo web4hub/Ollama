@@ -99,6 +99,87 @@ func TestSameGlobalScales(t *testing.T) {
 	})
 }
 
+// Create scales a stacked bank by its amax, so every expert holds the same
+// value. That value comes back as one element, still in MLX's representation.
+func TestUniformGlobalScale(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		if got := UniformGlobalScale(nil); got != nil {
+			t.Fatal("nil bank reported a uniform scale")
+		}
+
+		uniform := PrepareGatherQMMGlobalScale(ToMLXGlobalScale(mlx.NewScalarArray(0.25)), 4)
+		got := UniformGlobalScale(uniform)
+		if got == nil {
+			t.Fatal("broadcast scalar bank was not uniform")
+		}
+		mlx.Eval(got)
+		if dims := got.Dims(); len(dims) != 1 || dims[0] != 1 {
+			t.Fatalf("uniform scale dims = %v, want [1]", dims)
+		}
+		if want := float32(0.25 * mlx.Nvfp4MaxProduct); got.Floats()[0] != want {
+			t.Fatalf("uniform scale = %v, want %v", got.Floats()[0], want)
+		}
+
+		oneDiffers := PrepareGatherQMMGlobalScale(ToMLXGlobalScale(mlx.FromValues([]float32{0.25, 0.25, 0.5, 0.25}, 4)), 4)
+		if got := UniformGlobalScale(oneDiffers); got != nil {
+			t.Fatal("bank with one differing expert reported a uniform scale")
+		}
+	})
+}
+
+// Two banks share one fused bank when their scales agree for every expert, or
+// when each is uniform and can be applied to its half after the split.
+func TestFusedGlobalScales(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		bank := func(checkpoint ...float32) *mlx.Array {
+			return PrepareGatherQMMGlobalScale(ToMLXGlobalScale(mlx.FromValues(checkpoint, len(checkpoint))), 4)
+		}
+		perExpert := bank(0.5, 1, 2, 4)
+		gateUniform, upUniform := bank(0.25), bank(0.5)
+
+		for _, tt := range []struct {
+			name         string
+			a, b         *mlx.Array
+			wantOK       bool
+			wantBank     *mlx.Array
+			wantA, wantB float32 // checkpoint values; 0 means no split scale
+		}{
+			{name: "no scales", wantOK: true},
+			{name: "matching per-expert scales stay in the bank", a: perExpert, b: bank(0.5, 1, 2, 4), wantOK: true, wantBank: perExpert},
+			{name: "matching uniform scales stay in the bank", a: gateUniform, b: bank(0.25), wantOK: true, wantBank: gateUniform},
+			{name: "differing uniform scales split", a: gateUniform, b: upUniform, wantOK: true, wantA: 0.25, wantB: 0.5},
+			{name: "differing per-expert scales", a: perExpert, b: bank(4, 2, 1, 0.5)},
+			{name: "uniform and per-expert scales", a: gateUniform, b: perExpert},
+			{name: "only one bank scaled", a: gateUniform},
+		} {
+			gotBank, gotA, gotB, ok := FusedGlobalScales(tt.a, tt.b)
+			if ok != tt.wantOK {
+				t.Fatalf("%s: ok = %v, want %v", tt.name, ok, tt.wantOK)
+			}
+			if gotBank != tt.wantBank {
+				t.Fatalf("%s: bank scale = %v, want %v", tt.name, gotBank, tt.wantBank)
+			}
+			for _, split := range []struct {
+				got  *mlx.Array
+				want float32
+			}{{gotA, tt.wantA}, {gotB, tt.wantB}} {
+				if split.want == 0 {
+					if split.got != nil {
+						t.Fatalf("%s: unexpected split scale", tt.name)
+					}
+					continue
+				}
+				if split.got == nil {
+					t.Fatalf("%s: missing split scale", tt.name)
+				}
+				if values := split.got.Floats(); len(values) != 1 || values[0] != split.want*mlx.Nvfp4MaxProduct {
+					t.Fatalf("%s: split scale = %v, want [%v]", tt.name, values, split.want*mlx.Nvfp4MaxProduct)
+				}
+			}
+		}
+	})
+}
+
 // TestGatherQMMGlobalScaleMatchesDequantized checks the whole scale chain —
 // Prepare's conversion to amax units plus the GatherQMM wrapper — against the
 // dequantized weights gathered densely. Metal runs the native kernel path;

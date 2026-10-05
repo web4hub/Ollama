@@ -176,7 +176,7 @@ func (m *sparseMoE) Forward(x *mlx.Array, cfg *Config) *mlx.Array {
 	var gateUp *mlx.Array
 	if m.GateUpScales != nil {
 		gateUp = mlx.GatherQMM(xFlat, m.GateUpExperts, m.GateUpScales, m.GateUpBiases,
-			nil, indexFlat, true, m.GateUpGroup, m.GateUpBits, m.GateUpMode, nil, doSort)
+			nil, indexFlat, true, m.GateUpGroup, m.GateUpBits, m.GateUpMode, m.GateUpGlobalScales, doSort)
 	} else {
 		gateUp = mlx.GatherMM(xFlat, m.GateUpExperts, nil, indexFlat, doSort)
 	}
@@ -185,7 +185,7 @@ func (m *sparseMoE) Forward(x *mlx.Array, cfg *Config) *mlx.Array {
 	var down *mlx.Array
 	if m.DownScales != nil {
 		down = mlx.GatherQMM(hidden, m.DownExperts, m.DownScales, m.DownBiases,
-			nil, indexFlat, true, m.DownGroup, m.DownBits, m.DownMode, nil, doSort)
+			nil, indexFlat, true, m.DownGroup, m.DownBits, m.DownMode, m.DownGlobalScales, doSort)
 	} else {
 		down = mlx.GatherMM(hidden, m.DownExperts, nil, indexFlat, doSort)
 	}
@@ -197,7 +197,7 @@ func (m *sparseMoE) Forward(x *mlx.Array, cfg *Config) *mlx.Array {
 	differentiated := mlx.Reshape(down, B, L, topK, cfg.HiddenSize)
 	out := mlx.Sum(mlx.Mul(differentiated, mlx.ExpandDims(scores, -1)), 2, false)
 
-	shared := m.SharedDownProj.Forward(mlx.SwiGLU(m.SharedGateProj.Forward(x), m.SharedUpProj.Forward(x)))
+	shared := m.SharedDownProj.Forward(nn.SwiGLU(m.SharedGateProj, m.SharedUpProj, x))
 	shared = mlx.Mul(shared, mlx.Sigmoid(m.SharedGate.Forward(x)))
 	return mlx.Add(out, shared)
 }

@@ -617,9 +617,9 @@ func TestSwitchMLPMixedQuantizedGateUpDenseDownMatchesDense(t *testing.T) {
 	})
 }
 
-// Routed gate and up fuse into one nvfp4 bank only when their per-expert
-// global scales agree. gather_qmm applies one scale per expert across the
-// whole bank row, so the fused bank carries that scale and has to match
+// Routed gate and up with per-expert global scales fuse into one nvfp4 bank
+// only when those scales agree. gather_qmm applies one scale per expert across
+// the whole bank row, so the fused bank carries that scale and has to match
 // running the two projections separately.
 func TestSwitchMLPFusedGateUpGlobalScaleMatchesSeparate(t *testing.T) {
 	mlxtest.Run(t, func(t *mlxtest.T) {
@@ -678,6 +678,168 @@ func TestSwitchMLPFusedGateUpGlobalScaleMatchesSeparate(t *testing.T) {
 	})
 }
 
+// Create quantizes each stacked expert bank against its own amax, so routed
+// gate and up carry global scales that differ but are each uniform across
+// experts. They still share one fused bank: gather_qmm runs it unscaled and
+// each half takes its own scale after the split. Decode, and prefill, which
+// sorts tokens by expert, both have to match the dequantized weights.
+func TestTinyLagunaLoadWeightsFusesUniformGlobalScales(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		if !mlx.MetalIsAvailable() && !mlx.CUDAIsAvailable() {
+			t.Skip("gather_qmm requires a GPU backend")
+		}
+		// Every K is a whole 64-wide tile: on Metal GPUs with neural
+		// accelerators, MLX's sorted fp4 gather reads past a partial one.
+		const experts, hidden, intermediate = 4, 64, 64
+		cfg := &Config{
+			HiddenSize:                hidden,
+			IntermediateSize:          12,
+			MoeIntermediateSize:       intermediate,
+			SharedExpertIntermediate:  4,
+			NumHiddenLayers:           2,
+			NumAttentionHeads:         2,
+			NumAttentionHeadsPerLayer: []int32{2, 2},
+			NumKeyValueHeads:          1,
+			HeadDim:                   4,
+			VocabSize:                 16,
+			LayerTypes:                []string{"full_attention", "sliding_attention"},
+			MLPOnlyLayers:             []int32{0},
+			DecoderSparseStep:         1,
+			NumExperts:                experts,
+			NumExpertsPerTok:          2,
+			MoeRoutedScalingFactor:    2.5,
+			RMSNormEps:                1e-5,
+			QuantGroupSize:            16,
+			QuantBits:                 4,
+			QuantMode:                 "nvfp4",
+		}
+
+		tensors := tinyLagunaTensorsWithHidden(hidden)
+		for key := range tensors {
+			if strings.HasPrefix(key, "model.layers.1.mlp.experts.") {
+				delete(tensors, key)
+			}
+		}
+		tensors["model.layers.1.mlp.gate.weight"] = weights(experts, hidden)
+		dense := &SwitchMLP{GateUpWeightsSourceLayout: true, DownWeightSourceLayout: true}
+		for _, bank := range []struct {
+			proj       string
+			rows, cols int
+			scale      float32
+			dense      **mlx.Array
+		}{
+			{"gate_proj", intermediate, hidden, 0.1, &dense.GateWeight},
+			{"up_proj", intermediate, hidden, 0.04, &dense.UpWeight},
+			{"down_proj", hidden, intermediate, 0.05, &dense.DownWeight},
+		} {
+			w := makePatternExpertWeight(experts, bank.rows, bank.cols, bank.scale)
+			amax := mlx.Flatten(w.Abs()).MaxAxis(0, false).AsType(mlx.DTypeFloat32)
+			q, scales, _ := mlx.QuantizeWithGlobalScale(w, 16, 4, "nvfp4", amax)
+			globalScale := mlx.DivScalar(amax, mlx.Nvfp4MaxProduct)
+			key := "model.layers.1.mlp.experts." + bank.proj + ".weight"
+			tensors[key] = q
+			tensors[key+"_scale"] = scales
+			tensors[key+".global_scale"] = globalScale
+			*bank.dense = mlx.Dequantize(q, scales, nil, 16, 4, "nvfp4", model.ToMLXGlobalScale(globalScale))
+		}
+
+		m := &Model{
+			Config: cfg,
+			Layers: []*Layer{
+				{LayerIdx: 0, IsSliding: false},
+				{LayerIdx: 1, IsSliding: true},
+			},
+		}
+		if err := m.LoadWeights(tensors); err != nil {
+			t.Fatalf("LoadWeights failed: %v", err)
+		}
+		moe, ok := m.Layers[1].MLP.(*SparseMoE)
+		if !ok {
+			t.Fatalf("layer 1 MLP type = %T, want *SparseMoE", m.Layers[1].MLP)
+		}
+		fused := moe.SwitchMLP
+		if fused.GateUpWeightQ == nil {
+			t.Fatal("gate and up with differing uniform global scales were not fused")
+		}
+		if fused.GateUpGlobalScale != nil || fused.GateUpGateScale == nil || fused.GateUpUpScale == nil {
+			t.Fatal("the fused bank did not move its global scales past the split")
+		}
+
+		for _, tt := range []struct {
+			name string
+			B, L int
+		}{
+			{"decode", 1, 3},
+			{"prefill", 2, 40},
+		} {
+			tokens := tt.B * tt.L
+			xValues := make([]float32, tokens*hidden)
+			for i := range xValues {
+				xValues[i] = float32(i%13-6) / 8
+			}
+			x := mlx.FromValues(xValues, tt.B, tt.L, hidden).AsType(mlx.DTypeBFloat16)
+			// Two distinct experts per token, cycling through every pair.
+			indexValues := make([]int32, 0, tokens*int(cfg.NumExpertsPerTok))
+			for token := range tokens {
+				first := token % experts
+				second := (first + 1 + token/experts%(experts-1)) % experts
+				indexValues = append(indexValues, int32(first), int32(second))
+			}
+			indices := mlx.FromValues(indexValues, tokens, int(cfg.NumExpertsPerTok))
+
+			got := fused.Forward(x, indices, cfg).AsType(mlx.DTypeFloat32)
+			want := dense.Forward(x, indices, cfg).AsType(mlx.DTypeFloat32)
+			mlx.Eval(got, want)
+			// Each half is rounded before its scale is applied, which costs
+			// about an ulp of the largest output wherever a sum lands. Mixing
+			// up the two scales costs far more.
+			wantVals := want.Floats()
+			assertFloatSlicesClose(t, got.Floats(), wantVals, 0.02*outputRange(wantVals))
+		}
+	})
+}
+
+// A fused dense gate/up runs one unscaled quantized matmul and scales each
+// half after the split, which has to match running the two projections, each
+// with its own global scale, separately.
+func TestDenseMLPFusedGateUpGlobalScaleMatchesSeparate(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		quantized := func(rows, cols int, scale float32) *nn.QuantizedLinear {
+			w := mlx.Reshape(makePatternExpertWeight(1, rows, cols, scale), int32(rows), int32(cols))
+			amax := mlx.Flatten(w.Abs()).MaxAxis(0, false).AsType(mlx.DTypeFloat32)
+			q, scales, _ := mlx.QuantizeWithGlobalScale(w, 16, 4, "nvfp4", amax)
+			return &nn.QuantizedLinear{
+				Weight: q, Scales: scales, GlobalScale: model.ToMLXGlobalScale(mlx.DivScalar(amax, mlx.Nvfp4MaxProduct)),
+				GroupSize: 16, Bits: 4, Mode: "nvfp4",
+			}
+		}
+		gate, up, down := quantized(64, 64, 0.1), quantized(64, 64, 0.04), quantized(64, 64, 0.05)
+		fused := &DenseMLP{
+			GateProj: gate, UpProj: up, DownProj: down,
+			GateUpProj:      fuseDenseGateUp(gate, up),
+			GateUpGateScale: linearGlobalScale(gate),
+			GateUpUpScale:   linearGlobalScale(up),
+		}
+		if fused.GateUpProj == nil {
+			t.Fatal("nvfp4 gate and up with scalar global scales were not fused")
+		}
+		separate := &DenseMLP{GateProj: gate, UpProj: up, DownProj: down}
+
+		xValues := make([]float32, 3*64)
+		for i := range xValues {
+			xValues[i] = float32(i%13-6) / 8
+		}
+		x := mlx.FromValues(xValues, 1, 3, 64).AsType(mlx.DTypeBFloat16)
+		got := fused.Forward(x, nil).AsType(mlx.DTypeFloat32)
+		want := separate.Forward(x, nil).AsType(mlx.DTypeFloat32)
+		mlx.Eval(got, want)
+		// Both paths defer the same scales into the same activation, so only
+		// a different matmul kernel for the wider fused bank may round apart.
+		wantVals := want.Floats()
+		assertFloatSlicesClose(t, got.Floats(), wantVals, 0.01*outputRange(wantVals))
+	})
+}
+
 func TestDenseExpertWeightForGatherMMDequantizesQuantizedWeight(t *testing.T) {
 	mlxtest.Run(t, func(t *mlxtest.T) {
 		weight := makePatternExpertWeight(2, 4, 32, 0.011)
@@ -727,39 +889,43 @@ func TestCombinedTensorGlobalScaleIgnoresInputGlobalScale(t *testing.T) {
 }
 
 func tinyLagunaTensors() map[string]*mlx.Array {
+	return tinyLagunaTensorsWithHidden(32)
+}
+
+func tinyLagunaTensorsWithHidden(hidden int) map[string]*mlx.Array {
 	tensors := map[string]*mlx.Array{
-		"model.embed_tokens.weight": weights(16, 32),
-		"model.norm.weight":         ones(32),
-		"lm_head.weight":            weights(16, 32),
+		"model.embed_tokens.weight": weights(16, hidden),
+		"model.norm.weight":         ones(hidden),
+		"lm_head.weight":            weights(16, hidden),
 	}
 	for layer := range 2 {
 		prefix := "model.layers." + string(rune('0'+layer))
-		tensors[prefix+".input_layernorm.weight"] = ones(32)
-		tensors[prefix+".post_attention_layernorm.weight"] = ones(32)
-		tensors[prefix+".self_attn.q_proj.weight"] = weights(8, 32)
-		tensors[prefix+".self_attn.k_proj.weight"] = weights(4, 32)
-		tensors[prefix+".self_attn.v_proj.weight"] = weights(4, 32)
-		tensors[prefix+".self_attn.o_proj.weight"] = weights(32, 8)
-		tensors[prefix+".self_attn.g_proj.weight"] = weights(2, 32)
+		tensors[prefix+".input_layernorm.weight"] = ones(hidden)
+		tensors[prefix+".post_attention_layernorm.weight"] = ones(hidden)
+		tensors[prefix+".self_attn.q_proj.weight"] = weights(8, hidden)
+		tensors[prefix+".self_attn.k_proj.weight"] = weights(4, hidden)
+		tensors[prefix+".self_attn.v_proj.weight"] = weights(4, hidden)
+		tensors[prefix+".self_attn.o_proj.weight"] = weights(hidden, 8)
+		tensors[prefix+".self_attn.g_proj.weight"] = weights(2, hidden)
 		tensors[prefix+".self_attn.q_norm.weight"] = ones(4)
 		tensors[prefix+".self_attn.k_norm.weight"] = ones(4)
 	}
 
-	tensors["model.layers.0.mlp.gate_proj.weight"] = weights(12, 32)
-	tensors["model.layers.0.mlp.up_proj.weight"] = weights(12, 32)
-	tensors["model.layers.0.mlp.down_proj.weight"] = weights(32, 12)
+	tensors["model.layers.0.mlp.gate_proj.weight"] = weights(12, hidden)
+	tensors["model.layers.0.mlp.up_proj.weight"] = weights(12, hidden)
+	tensors["model.layers.0.mlp.down_proj.weight"] = weights(hidden, 12)
 
-	tensors["model.layers.1.mlp.gate.weight"] = weights(2, 32)
+	tensors["model.layers.1.mlp.gate.weight"] = weights(2, hidden)
 	tensors["model.layers.1.mlp.experts.e_score_correction_bias"] = mlx.FromValues([]float32{0.1, -0.1}, 2)
 	for expert := range 2 {
 		prefix := "model.layers.1.mlp.experts." + string(rune('0'+expert))
-		tensors[prefix+".gate_proj.weight"] = weights(4, 32)
-		tensors[prefix+".up_proj.weight"] = weights(4, 32)
-		tensors[prefix+".down_proj.weight"] = weights(32, 4)
+		tensors[prefix+".gate_proj.weight"] = weights(4, hidden)
+		tensors[prefix+".up_proj.weight"] = weights(4, hidden)
+		tensors[prefix+".down_proj.weight"] = weights(hidden, 4)
 	}
-	tensors["model.layers.1.mlp.shared_expert.gate_proj.weight"] = weights(4, 32)
-	tensors["model.layers.1.mlp.shared_expert.up_proj.weight"] = weights(4, 32)
-	tensors["model.layers.1.mlp.shared_expert.down_proj.weight"] = weights(32, 4)
+	tensors["model.layers.1.mlp.shared_expert.gate_proj.weight"] = weights(4, hidden)
+	tensors["model.layers.1.mlp.shared_expert.up_proj.weight"] = weights(4, hidden)
+	tensors["model.layers.1.mlp.shared_expert.down_proj.weight"] = weights(hidden, 4)
 	return tensors
 }
 
@@ -781,10 +947,21 @@ func assertFloatSlicesClose(t *mlxtest.T, got, want []float32, tol float64) {
 		t.Fatalf("length mismatch: got %d want %d", len(got), len(want))
 	}
 	for i := range got {
-		if math.Abs(float64(got[i]-want[i])) > tol {
+		// Written so a NaN on either side fails rather than slipping past.
+		if !(math.Abs(float64(got[i]-want[i])) <= tol) {
 			t.Fatalf("value[%d] = %v, want %v (tol=%g)", i, got[i], want[i], tol)
 		}
 	}
+}
+
+// outputRange is the largest magnitude in want, and at least 1, for
+// tolerances that scale with the outputs rather than with each element.
+func outputRange(want []float32) float64 {
+	r := 1.0
+	for _, v := range want {
+		r = math.Max(r, math.Abs(float64(v)))
+	}
+	return r
 }
 
 func weights(rows, cols int) *mlx.Array {

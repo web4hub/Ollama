@@ -356,7 +356,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 			k := linears.Make(layerPrefix + ".self_attn.k_proj")
 			v := linears.Make(layerPrefix + ".self_attn.v_proj")
 			if k != nil && v != nil {
-				kv, err := stackLinears(k, v)
+				kv, err := nn.StackLinears(k, v)
 				if err != nil {
 					return fmt.Errorf("dflash layer %d k|v: %w", i, err)
 				}
@@ -365,7 +365,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		}
 		if gate := linears.Make(layerPrefix + ".mlp.gate_proj"); gate != nil {
 			if up := linears.Make(layerPrefix + ".mlp.up_proj"); up != nil {
-				gu, err := stackLinears(gate, up)
+				gu, err := nn.StackLinears(gate, up)
 				if err != nil {
 					return fmt.Errorf("dflash layer %d gate|up: %w", i, err)
 				}
@@ -404,89 +404,6 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		m.Layers[i] = layer
 	}
 	return nil
-}
-
-// stackLinears concatenates two linears along the output dimension. Quant
-// groups run along the input dimension, so this is exact; per-tensor global
-// scales are expanded to per-row so each half keeps its own.
-func stackLinears(a, b nn.LinearLayer) (nn.LinearLayer, error) {
-	if pa, ok := a.(*nn.Linear); ok {
-		pb, ok := b.(*nn.Linear)
-		if !ok {
-			return nil, fmt.Errorf("stack linears: mixed plain and quantized parts")
-		}
-		return &nn.Linear{
-			Weight: mlx.Concatenate([]*mlx.Array{pa.Weight, pb.Weight}, 0),
-			Bias:   concatBias(pa.Bias, int32(pa.Weight.Dim(0)), pb.Bias, int32(pb.Weight.Dim(0))),
-		}, nil
-	}
-	qa, ok := a.(*nn.QuantizedLinear)
-	if !ok {
-		return nil, fmt.Errorf("stack linears: unsupported layer type %T", a)
-	}
-	qb, ok := b.(*nn.QuantizedLinear)
-	if !ok {
-		return nil, fmt.Errorf("stack linears: mixed plain and quantized parts")
-	}
-	if qa.GroupSize != qb.GroupSize || qa.Bits != qb.Bits || qa.Mode != qb.Mode {
-		return nil, fmt.Errorf("stack linears: quant mode mismatch %s/%d/%d vs %s/%d/%d",
-			qa.Mode, qa.Bits, qa.GroupSize, qb.Mode, qb.Bits, qb.GroupSize)
-	}
-	if (qa.QBiases == nil) != (qb.QBiases == nil) {
-		return nil, fmt.Errorf("stack linears: quant bias layout mismatch")
-	}
-	out := &nn.QuantizedLinear{
-		Weight:    mlx.Concatenate([]*mlx.Array{qa.Weight, qb.Weight}, 0),
-		Scales:    mlx.Concatenate([]*mlx.Array{qa.Scales, qb.Scales}, 0),
-		GroupSize: qa.GroupSize,
-		Bits:      qa.Bits,
-		Mode:      qa.Mode,
-	}
-	if qa.QBiases != nil {
-		out.QBiases = mlx.Concatenate([]*mlx.Array{qa.QBiases, qb.QBiases}, 0)
-	}
-	out.Bias = concatBias(qa.Bias, int32(qa.Scales.Dim(0)), qb.Bias, int32(qb.Scales.Dim(0)))
-	if qa.GlobalScale != nil || qb.GlobalScale != nil {
-		out.GlobalScale = mlx.Concatenate([]*mlx.Array{
-			perRowGlobal(qa.GlobalScale, int32(qa.Scales.Dim(0))),
-			perRowGlobal(qb.GlobalScale, int32(qb.Scales.Dim(0))),
-		}, 0)
-	}
-	return out, nil
-}
-
-// perRowGlobal expands a per-tensor global scale to a per-row vector; an
-// already per-row scale passes through unchanged. A nil scale fills with the
-// identity, which in MLX's representation is Nvfp4MaxProduct rather than 1.
-func perRowGlobal(g *mlx.Array, rows int32) *mlx.Array {
-	identity := make([]float32, rows)
-	for i := range identity {
-		identity[i] = mlx.Nvfp4MaxProduct
-	}
-	v := mlx.FromValues(identity, int(rows))
-	if g == nil {
-		return v
-	}
-	return mlx.Mul(mlx.DivScalar(v, mlx.Nvfp4MaxProduct), g)
-}
-
-func concatBias(a *mlx.Array, aRows int32, b *mlx.Array, bRows int32) *mlx.Array {
-	if a == nil && b == nil {
-		return nil
-	}
-	fill := func(bias *mlx.Array, rows int32, like *mlx.Array) *mlx.Array {
-		if bias != nil {
-			return bias
-		}
-		return mlx.ZerosF32([]int32{rows}).AsType(like.DType())
-	}
-	if a == nil {
-		a = fill(nil, aRows, b)
-	}
-	if b == nil {
-		b = fill(nil, bRows, a)
-	}
-	return mlx.Concatenate([]*mlx.Array{a, b}, 0)
 }
 
 // sliceLinearRows returns rows [start, stop) of l along the output dimension.

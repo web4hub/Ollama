@@ -81,12 +81,12 @@ var SwiGLU = Compile2(
 var swiGLUScaled = Compile(
 	"SwiGLUScaled",
 	func(in ...*Array) []*Array {
-		gate, gateFactor, up, upFactor := in[0], in[1], in[2], in[3]
+		gate, gateScale, up, upScale := in[0], in[1], in[2], in[3]
 		// Preserve the standalone scale path's rounding before applying
 		// SwiGLU. Compile still keeps these casts in the fused kernel instead
 		// of materializing two scaled projection outputs.
-		gate = Mul(gate, gateFactor).AsType(gate.DType())
-		up = Mul(up, upFactor).AsType(up.DType())
+		gate = Mul(gate, globalScaleFactor(gateScale)).AsType(gate.DType())
+		up = Mul(up, globalScaleFactor(upScale)).AsType(up.DType())
 		return []*Array{SiLU(gate).Multiply(up)}
 	},
 	Shapeless(),
@@ -115,9 +115,9 @@ func SwiGLUScaled(gate, gateScale, up, upScale *Array) *Array {
 	if upScale == nil {
 		upScale = identityGlobalScale()
 	}
-	// Rank 0 or one-dimensional, so convert once here rather than per output
-	// element inside the compiled function.
-	return swiGLUScaled(gate, globalScaleFactor(gateScale), up, globalScaleFactor(upScale))[0]
+	// Convert inside the compiled activation to avoid two separate kernels,
+	// including for broadcast per-expert scales during gathered matmuls.
+	return swiGLUScaled(gate, gateScale, up, upScale)[0]
 }
 
 // LogitSoftcap returns tanh(x / cap) * cap as a fused kernel. Matches

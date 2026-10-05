@@ -124,8 +124,8 @@ func TestSupportsGatherQMM(t *testing.T) {
 
 // Gate and up fuse into one quantized bank when their global scales agree,
 // since gather_qmm applies one scale per expert across the whole bank row.
-// Scales that disagree cannot share a bank and stay on separate projections.
-// Either way the result has to match the dequantized weights.
+// Per-expert scales that disagree cannot share a bank and stay on separate
+// projections. Either way the result has to match the dequantized weights.
 func TestLoadSwitchMLPGlobalScaleFusion(t *testing.T) {
 	mlxtest.Run(t, func(t *mlxtest.T) {
 		const experts, width, group = 4, 64, 16
@@ -241,6 +241,119 @@ func TestLoadSwitchMLPGlobalScaleFusion(t *testing.T) {
 					}
 				}
 			}()
+		}
+	})
+}
+
+// Create quantizes each stacked expert bank against its own amax, so gate and
+// up carry global scales that differ but are each uniform across experts.
+// They still share one fused bank: gather_qmm runs it unscaled and each half
+// takes its own scale after the split. Decode, and prefill, which sorts tokens
+// by expert, both have to match the dequantized weights.
+func TestLoadSwitchMLPFusesUniformGlobalScales(t *testing.T) {
+	mlxtest.Run(t, func(t *mlxtest.T) {
+		if !mlx.MetalIsAvailable() && !mlx.CUDAIsAvailable() {
+			t.Skip("gather_qmm requires a GPU backend")
+		}
+		// Every K is a whole 64-wide tile: on Metal GPUs with neural
+		// accelerators, MLX's sorted fp4 gather reads past a partial one.
+		const experts, hidden, intermediate, group = 4, 64, 64, 16
+		cfg := &Config{
+			HiddenSize:       hidden,
+			NumExperts:       experts,
+			QuantGroupSize:   group,
+			QuantBits:        4,
+			QuantMode:        "nvfp4",
+			NumExpertsPerTok: 2,
+		}
+		prefix := "model.layers.0"
+
+		buildTensors := func() map[string]*mlx.Array {
+			tensors := make(map[string]*mlx.Array)
+			for _, bank := range []struct {
+				proj       string
+				rows, cols int
+				scale      float32
+			}{
+				{"gate_proj", intermediate, hidden, 0.1},
+				{"up_proj", intermediate, hidden, 0.04},
+				{"down_proj", hidden, intermediate, 0.05},
+			} {
+				values := make([]float32, experts*bank.rows*bank.cols)
+				for i := range values {
+					values[i] = float32(i%23-11) * bank.scale
+				}
+				w := mlx.FromValues(values, experts, bank.rows, bank.cols).AsType(mlx.DTypeBFloat16)
+				amax := mlx.Flatten(w.Abs()).MaxAxis(0, false).AsType(mlx.DTypeFloat32)
+				q, scales, _ := mlx.QuantizeWithGlobalScale(w, group, 4, "nvfp4", amax)
+				key := prefix + ".mlp.experts." + bank.proj + ".weight"
+				tensors[key] = q
+				tensors[key+"_scale"] = scales
+				tensors[key+".global_scale"] = mlx.DivScalar(amax, mlx.Nvfp4MaxProduct)
+			}
+			return tensors
+		}
+
+		switchMLP, err := loadSwitchMLP(buildTensors(), cfg, true, prefix)
+		if err != nil {
+			t.Fatalf("loadSwitchMLP() failed: %v", err)
+		}
+		if switchMLP.GateUpWeightQ == nil {
+			t.Fatal("gate and up with differing uniform global scales were not fused")
+		}
+		if switchMLP.GateUpGlobalScales != nil || switchMLP.GateUpGateScale == nil || switchMLP.GateUpUpScale == nil {
+			t.Fatal("the fused bank did not move its global scales past the split")
+		}
+		dense, err := loadSwitchMLP(buildTensors(), cfg, false, prefix)
+		if err != nil {
+			t.Fatalf("loadSwitchMLP(useQuantized=false) failed: %v", err)
+		}
+
+		for _, tt := range []struct {
+			name string
+			B, L int
+		}{
+			{"decode", 1, 3},
+			{"prefill", 2, 40},
+		} {
+			tokens := tt.B * tt.L
+			xValues := make([]float32, tokens*hidden)
+			for i := range xValues {
+				xValues[i] = float32(i%13-6) / 8
+			}
+			x := mlx.FromValues(xValues, tt.B, tt.L, hidden).AsType(mlx.DTypeBFloat16)
+			// Two distinct experts per token, cycling through every pair.
+			indexValues := make([]int32, 0, tokens*int(cfg.NumExpertsPerTok))
+			for token := range tokens {
+				first := token % experts
+				second := (first + 1 + token/experts%(experts-1)) % experts
+				indexValues = append(indexValues, int32(first), int32(second))
+			}
+			indices := mlx.FromValues(indexValues, tt.B, tt.L, int(cfg.NumExpertsPerTok))
+
+			out := switchMLP.Forward(x, indices, cfg).AsType(mlx.DTypeFloat32)
+			ref := dense.Forward(x, indices, cfg).AsType(mlx.DTypeFloat32)
+			mlx.Eval(out, ref)
+			gotVals, wantVals := out.Floats(), ref.Floats()
+			if len(gotVals) != len(wantVals) {
+				t.Fatalf("%s: output length = %d, want %d", tt.name, len(gotVals), len(wantVals))
+			}
+			// Each half is rounded before its scale is applied, which costs
+			// about an ulp of the largest output wherever a sum lands. Mixing
+			// up the two scales costs far more.
+			tolerance := 1.0
+			for _, want := range wantVals {
+				tolerance = math.Max(tolerance, math.Abs(float64(want)))
+			}
+			tolerance *= 0.02
+			for i, got := range gotVals {
+				if math.IsNaN(float64(got)) || math.IsInf(float64(got), 0) {
+					t.Fatalf("%s: output[%d] = %v, want finite", tt.name, i, got)
+				}
+				if delta := math.Abs(float64(got - wantVals[i])); delta > tolerance {
+					t.Fatalf("%s: output[%d] = %v, want %v (delta %v > %v)", tt.name, i, got, wantVals[i], delta, tolerance)
+				}
+			}
 		}
 	})
 }
