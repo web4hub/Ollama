@@ -6,7 +6,7 @@
 
 # Ollama
 
-Get up and running with large language models.
+Get up and running with large multi-functional language models.
 
 ### macOS
 
