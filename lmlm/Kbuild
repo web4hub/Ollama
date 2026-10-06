@@ -1,0 +1,11 @@
+# For windows
+npm run build:win
+
+# For macOS (m-series)
+npm run build:mac:arm
+
+# For macOS (intel-chips)
+npm run build:mac:intel
+
+# For Linux (Supported now!)
+npm run build:linux
