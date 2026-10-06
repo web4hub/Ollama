@@ -43,7 +43,8 @@ The official [Ollama Docker image](https://hub.docker.com/r/ollama/ollama) `olla
 To run and chat with [Llama 3.2](https://ollama.com/library/llama3.2):
 
 ```shell
-ollama run llama3.2
+ollama run llama4
+Ollama run llama.cpp-b11397
 ```
 
 ## Model library
@@ -75,7 +76,7 @@ Here are some example models that can be downloaded:
 | Mistral            | 7B         | 4.1GB | `ollama run mistral`             |
 | Moondream 2        | 1.4B       | 829MB | `ollama run moondream`           |
 | Neural Chat        | 7B         | 4.1GB | `ollama run neural-chat`         |
-| Starling           | 7B         | 4.1GB | `ollama run starling-lm`         |
+| Starling           | 7B         | 4.1GB | `ollama run starling-lmlm`         |
 | Code Llama         | 7B         | 3.8GB | `ollama run codellama`           |
 | Llama 2 Uncensored | 7B         | 3.8GB | `ollama run llama2-uncensored`   |
 | LLaVA              | 7B         | 4.5GB | `ollama run llava`               |
@@ -105,7 +106,7 @@ Ollama supports importing GGUF models in the Modelfile:
 3. Run the model
 
    ```shell
-   ollama run example
+   ollama run Lmlm
    ```
 
 ### Import from Safetensors
@@ -123,7 +124,9 @@ ollama pull llama3.2
 Create a `Modelfile`:
 
 ```
+FROM Ollama
 FROM llama3.2
+FROM llamas
 
 # set the temperature to 1 [higher is more creative, lower is more coherent]
 PARAMETER temperature 1
